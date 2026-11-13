@@ -1,6 +1,8 @@
 import ast
 import re
 from functools import lru_cache
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
@@ -13,13 +15,61 @@ from backend.app.services.public_ids import format_public_id
 
 
 logger = service_logger("neo4j")
+_OPEN_NEO4J_DRIVERS: set = set()
 
 
 @lru_cache
+def running_in_container() -> bool:
+    return Path("/.dockerenv").exists()
+
+
+@lru_cache
+def neo4j_uri_candidates(uri: str) -> tuple[str, ...]:
+    if not uri:
+        return ()
+    candidates = [uri]
+    parsed = urlsplit(uri)
+    if parsed.hostname in {"localhost", "127.0.0.1"} and running_in_container():
+        for host in ("host.docker.internal", "neo4j"):
+            rewritten = urlunsplit(parsed._replace(netloc=f"{host}:{parsed.port}" if parsed.port else host))
+            if rewritten not in candidates:
+                candidates.append(rewritten)
+    return tuple(candidates)
+
+
+@lru_cache
+def _neo4j_driver(uri: str, username: str, password: str):
+    driver = GraphDatabase.driver(uri, auth=(username, password), connection_timeout=8)
+    _OPEN_NEO4J_DRIVERS.add(driver)
+    return driver
+
+
+def reset_neo4j_connections() -> None:
+    for driver in list(_OPEN_NEO4J_DRIVERS):
+        try:
+            driver.close()
+        except Exception:
+            pass
+    _OPEN_NEO4J_DRIVERS.clear()
+    _neo4j_driver.cache_clear()
+    neo4j_uri_candidates.cache_clear()
+    running_in_container.cache_clear()
+
+
 def neo4j_driver():
     if not settings.neo4j_uri or not settings.neo4j_username or not settings.neo4j_password:
         raise RuntimeError("Neo4j is not configured")
-    return GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_username, settings.neo4j_password), connection_timeout=8)
+    last_error: Exception | None = None
+    for uri in neo4j_uri_candidates(settings.neo4j_uri):
+        driver = _neo4j_driver(uri, settings.neo4j_username, settings.neo4j_password)
+        try:
+            driver.verify_connectivity()
+            if uri != settings.neo4j_uri:
+                logger.info("neo4j_uri_fallback_selected", extra={"configured_uri": settings.neo4j_uri, "resolved_uri": uri})
+            return driver
+        except (Neo4jError, ServiceUnavailable, OSError, RuntimeError) as exc:
+            last_error = exc
+    raise ServiceUnavailable(f"Neo4j connectivity failed for all configured URI candidates: {neo4j_uri_candidates(settings.neo4j_uri)}") from last_error
 
 
 def ensure_graph_schema() -> None:
@@ -137,7 +187,7 @@ def graph_suitability(job: JobPosting, candidate: Candidate, user: User, resume:
                 session.run("MATCH (j:Job {job_id:$job_id}),(c:Candidate {candidate_id:$candidate_id}) UNWIND $required AS name MERGE (s:Skill {key:toLower(name)}) SET s.name=name MERGE (j)-[:REQUIRES]->(s) FOREACH (_ IN CASE WHEN name IN $matched THEN [1] ELSE [] END | MERGE (c)-[:HAS_SKILL]->(s)) FOREACH (_ IN CASE WHEN NOT (name IN $matched) THEN [1] ELSE [] END | MERGE (c)-[:MISSING_SKILL]->(s))",job_id=job.job_id,candidate_id=candidate.candidate_id,required=required,matched=matched).consume()
             session.run("MATCH (c:Candidate {candidate_id:$candidate_id})-[a:APPLIED_TO]->(j:Job {job_id:$job_id}) SET a.semantic_score=$score",candidate_id=candidate.candidate_id,job_id=job.job_id,score=semantic_score).consume()
         logger.info("applicant_graph_updated",extra={"candidate_id":candidate.candidate_id,"job_id":job.job_id,"resume_id":resume.resume_id,"nodes":len(graph["nodes"]),"edges":len(graph["edges"])})
-    except (Neo4jError, ServiceUnavailable, RuntimeError) as exc:
+    except (Neo4jError, ServiceUnavailable, OSError, RuntimeError) as exc:
         source="fallback"; logger.warning("neo4j_graph_unavailable",extra={"candidate_id":candidate.candidate_id,"job_id":job.job_id,"error_type":type(exc).__name__})
     result={"candidate_id":candidate.candidate_id,"job_id":job.job_id,"matched_skills":matched,"missing_skills":missing,"semantic_score":semantic_score,"explanation":suitability_text(matched,missing,semantic_score),"source":source,"graph":graph}
     cache_set(key,result,settings.cache_graph_ttl)
@@ -146,7 +196,7 @@ def graph_suitability(job: JobPosting, candidate: Candidate, user: User, resume:
 
 def neo4j_health() -> bool:
     try: neo4j_driver().verify_connectivity(); return True
-    except (Neo4jError, ServiceUnavailable, RuntimeError): return False
+    except (Neo4jError, ServiceUnavailable, OSError, RuntimeError): return False
 
 
 def clear_graph_cache(candidate_id: int | None = None) -> None:

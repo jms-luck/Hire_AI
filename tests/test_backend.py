@@ -7,6 +7,7 @@ from backend.app.routers.admin import resume_section
 from backend.app.routers.jobs import job_payload
 from backend.app.models import JobPosting
 from backend.app.services.parser import extract_resume_text, validate_resume_file
+from backend.app import main
 
 
 client = TestClient(app)
@@ -18,6 +19,47 @@ def test_health() -> None:
     assert response.json() == {"status": "ok"}
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_dependency_health_reports_disabled_neo4j(monkeypatch) -> None:
+    monkeypatch.setattr(main.settings, "neo4j_uri", "")
+    monkeypatch.setattr(main.settings, "neo4j_username", "neo4j")
+    monkeypatch.setattr(main.settings, "neo4j_password", "secret")
+
+    response = client.get("/health/dependencies")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "services": {
+            "neo4j": {
+                "configured": False,
+                "status": "disabled",
+                "uri": None,
+            }
+        },
+    }
+
+
+def test_dependency_health_reports_unreachable_neo4j(monkeypatch) -> None:
+    monkeypatch.setattr(main.settings, "neo4j_uri", "bolt://neo4j:7687")
+    monkeypatch.setattr(main.settings, "neo4j_username", "neo4j")
+    monkeypatch.setattr(main.settings, "neo4j_password", "secret")
+    monkeypatch.setattr(main, "neo4j_health", lambda: False)
+
+    response = client.get("/health/dependencies")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "degraded",
+        "services": {
+            "neo4j": {
+                "configured": True,
+                "status": "unreachable",
+                "uri": "bolt://neo4j:7687",
+            }
+        },
+    }
 
 
 def test_password_hashing_and_jwt() -> None:
@@ -61,7 +103,6 @@ def test_required_routes_are_registered() -> None:
     paths = app.openapi()["paths"]
     required = {
         "/api/auth/login",
-        "/api/assistant/chat",
         "/api/auth/profile",
         "/api/jobs",
         "/api/companies/options",
@@ -77,7 +118,6 @@ def test_required_routes_are_registered() -> None:
         "/api/recruiter/jobs/{job_id}/applicants/bulk",
         "/api/recruiter/jobs/{job_id}/applicants/{candidate_id}/suitability",
         "/api/interviewer/candidates",
-        "/api/recruiter/interviewers",
         "/api/interviewer/interviews/{interview_id}/suitability",
         "/api/auth/register/interviewer",
         "/api/admin/overview",

@@ -23,5 +23,4 @@ pwdlib[argon2]
 azure-storage-blob
 qdrant-client
 redis>=5,<6
-openpyxl>=3.1,<4
 pytest

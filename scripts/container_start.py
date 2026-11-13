@@ -19,6 +19,15 @@ from backend.app.services.cache import redis_client
 from backend.app.services.graph import neo4j_driver
 
 
+NEO4J_COUNT_QUERY = (
+    "CALL { MATCH (c:Candidate) RETURN count(c) AS candidates } "
+    "CALL { MATCH (r:Resume) RETURN count(r) AS resumes } "
+    "CALL { MATCH ()-[a:APPLIED_TO]->() WHERE a.application_id IS NOT NULL RETURN count(a) AS applications } "
+    "CALL { MATCH ()-[t:IN_TALENT_POOL]->() RETURN count(t) AS talent_pool } "
+    "RETURN candidates, resumes, applications, talent_pool"
+)
+
+
 def requires_seed(source_count: int, indexed_count: int | None) -> bool | None:
     return None if indexed_count is None else indexed_count < source_count
 
@@ -68,12 +77,7 @@ def neo4j_plan(source: dict[str, int]) -> dict:
         return {"state": "disabled", "seed_required": False}
     try:
         with neo4j_driver().session() as session:
-            counts = session.run(
-                "MATCH (c:Candidate) WITH count(c) AS candidates "
-                "OPTIONAL MATCH (r:Resume) WITH candidates, count(r) AS resumes "
-                "OPTIONAL MATCH ()-[a:APPLIED_TO]->() WITH candidates, resumes, count(a) AS applications "
-                "OPTIONAL MATCH ()-[t:IN_TALENT_POOL]->() RETURN candidates, resumes, applications, count(t) AS talent_pool"
-            ).single()
+            counts = session.run(NEO4J_COUNT_QUERY).single()
         indexed = {"candidate_nodes": counts["candidates"], "resume_nodes": counts["resumes"], "application_edges": counts["applications"], "talent_pool_edges": counts["talent_pool"]}
         needed = any(indexed[key] < source[key] for key in indexed)
         rebuild = any(indexed[key] > source[key] for key in indexed)

@@ -11,8 +11,9 @@ from backend.app.core.config import settings
 from backend.app.core.logging_config import service_logger, setup_logging
 from backend.app.core.rate_limit import rate_limit_request
 from backend.app.core.security_headers import security_headers_request
-from backend.app.routers import admin, assistant, auth, bulk, candidate, companies, interviews, jobs, matching, resumes
+from backend.app.routers import admin, auth, bulk, candidate, companies, interviews, jobs, matching, resumes
 from backend.app.services.bootstrap import ensure_default_admin
+from backend.app.services.graph import neo4j_health
 from backend.app.services.verification_codes import ensure_company_verification_codes
 from backend.app.database.connection import SessionLocal
 
@@ -47,7 +48,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth.router, prefix=settings.api_prefix)
-app.include_router(assistant.router, prefix=settings.api_prefix)
 app.include_router(companies.router, prefix=settings.api_prefix)
 app.include_router(jobs.router, prefix=settings.api_prefix)
 app.include_router(candidate.router, prefix=settings.api_prefix)
@@ -61,6 +61,25 @@ app.include_router(bulk.router, prefix=settings.api_prefix)
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/dependencies")
+def dependency_health() -> dict[str, object]:
+    neo4j_configured = bool(settings.neo4j_uri and settings.neo4j_username and settings.neo4j_password)
+    neo4j_status = "disabled"
+    if neo4j_configured:
+        neo4j_status = "ok" if neo4j_health() else "unreachable"
+    overall_status = "ok" if neo4j_status in {"ok", "disabled"} else "degraded"
+    return {
+        "status": overall_status,
+        "services": {
+            "neo4j": {
+                "configured": neo4j_configured,
+                "status": neo4j_status,
+                "uri": settings.neo4j_uri if settings.neo4j_uri else None,
+            }
+        },
+    }
 
 
 frontend_dist = Path(settings.frontend_dist_dir).resolve()

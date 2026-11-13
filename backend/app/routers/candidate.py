@@ -1,13 +1,13 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.core.dependencies import get_candidate
 from backend.app.database.connection import get_db
-from backend.app.models import Application, Candidate, Company, DsaEvaluation, Interview, JobPosting, Resume, User
+from backend.app.models import Application, Candidate, Company, DsaEvaluation, JobPosting, Resume, User
 from backend.app.schemas.contracts import ApplicationCreate, ApplicationResponse, DsaEvaluationRequest, DsaEvaluationResponse, ResumeResponse
 from backend.app.services.ai import index_resume_for_job
 from backend.app.services.cache import cache_get, cache_set
@@ -19,6 +19,17 @@ from backend.app.services.github_profiles import GitHubProfileError, evaluate_gi
 
 router = APIRouter(tags=["candidate"])
 logger = logging.getLogger("hireai.candidate")
+
+
+def sync_submitted_application(job: JobPosting, candidate: Candidate, user: User, resume: Resume, company: Company, application: Application) -> None:
+    try:
+        index_resume_for_job(job, resume)
+    except Exception:
+        logger.exception("Could not index resume %s for job %s", resume.resume_id, job.job_id)
+    try:
+        sync_application_entities(job, candidate, user, resume, company, application.application_id, application.status, "JOB", application.applied_at)
+    except Exception:
+        logger.exception("Could not sync Neo4j application %s", application.application_id)
 
 
 @router.get("/candidate/profile")
@@ -92,24 +103,13 @@ def candidate_resumes(candidate: Candidate = Depends(get_candidate), db: Session
     return list(db.scalars(select(Resume).where(Resume.candidate_id == candidate.candidate_id).order_by(Resume.version.desc())))
 
 
-@router.get("/candidate/applications")
-def candidate_applications(candidate: Candidate = Depends(get_candidate), db: Session = Depends(get_db)) -> list[dict]:
-    rows = db.execute(select(Application, JobPosting, Company, Interview).join(JobPosting, Application.job_id == JobPosting.job_id).join(Company, JobPosting.company_id == Company.company_id).outerjoin(Interview, Interview.application_id == Application.application_id).where(Application.candidate_id == candidate.candidate_id).order_by(Application.applied_at.desc())).all()
-    return [{
-        "application_id": application.application_id,
-        "job_id": job.job_id,
-        "job_title": job.job_title,
-        "company_name": company.company_name,
-        "resume_id": application.resume_id,
-        "status": application.status,
-        "applied_at": application.applied_at,
-        "interview_status": interview.status if interview else None,
-        "interview_scheduled_at": interview.scheduled_at if interview else None,
-    } for application, job, company, interview in rows]
+@router.get("/candidate/applications", response_model=list[ApplicationResponse])
+def candidate_applications(candidate: Candidate = Depends(get_candidate), db: Session = Depends(get_db)) -> list[Application]:
+    return list(db.scalars(select(Application).where(Application.candidate_id == candidate.candidate_id).order_by(Application.applied_at.desc())))
 
 
 @router.post("/jobs/{job_id}/apply", response_model=ApplicationResponse, status_code=201)
-def apply(job_id: int, payload: ApplicationCreate, candidate: Candidate = Depends(get_candidate), db: Session = Depends(get_db)) -> Application:
+def apply(job_id: int, payload: ApplicationCreate, background_tasks: BackgroundTasks, candidate: Candidate = Depends(get_candidate), db: Session = Depends(get_db)) -> Application:
     job = db.get(JobPosting, job_id)
     resume = db.get(Resume, payload.resume_id)
     if not job or job.status != "ACTIVE":
@@ -124,15 +124,7 @@ def apply(job_id: int, payload: ApplicationCreate, candidate: Candidate = Depend
         db.rollback()
         raise HTTPException(status_code=409, detail="You already applied for this job")
     db.refresh(application)
-    try:
-        index_resume_for_job(job, resume)
-    except Exception:
-        # The application remains authoritative; recruiter ranking retries indexing.
-        logger.exception("Could not index resume %s for job %s", resume.resume_id, job_id)
-    try:
-        user = db.get(User, candidate.user_id)
-        company = db.get(Company, job.company_id)
-        sync_application_entities(job, candidate, user, resume, company, application.application_id, application.status, "JOB", application.applied_at)
-    except Exception:
-        logger.exception("Could not sync Neo4j application %s", application.application_id)
+    user = db.get(User, candidate.user_id)
+    company = db.get(Company, job.company_id)
+    background_tasks.add_task(sync_submitted_application, job, candidate, user, resume, company, application)
     return application

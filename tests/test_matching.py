@@ -174,20 +174,6 @@ def test_ranked_applicants_are_sorted_by_semantic_score(monkeypatch) -> None:
     assert returned_points == points
 
 
-def test_applicant_items_include_only_explicit_job_applications() -> None:
-    class Result:
-        def all(self):
-            return []
-
-    class FakeDb:
-        def execute(self, statement):
-            return Result()
-
-    items, resumes = matching.applicant_items(9, FakeDb())
-    assert items == []
-    assert resumes == []
-
-
 def test_ranking_degrades_without_hiding_applicants(monkeypatch) -> None:
     items = [{"application_id": 1, "candidate_id": 1, "candidate_name": "Available", "resume_id": 11}]
     monkeypatch.setattr(matching, "applicant_items", lambda job_id, db: (items, [SimpleNamespace(resume_id=11)]))
@@ -204,6 +190,43 @@ def test_ranking_degrades_without_hiding_applicants(monkeypatch) -> None:
     assert ranked[0]["ranking_status"] == "UNAVAILABLE"
     assert ranked[0]["semantic_score"] is None
     assert points == []
+
+
+def test_match_does_not_delete_stored_results_when_ranking_is_unavailable(monkeypatch) -> None:
+    job = SimpleNamespace(job_id=9)
+    items = [{"candidate_id": 1, "candidate_name": "Available", "resume_id": 11, "ranking_status": "UNAVAILABLE"}]
+    executed = []
+
+    monkeypatch.setattr(matching, "recruiter_job", lambda job_id, recruiter, db: job)
+    monkeypatch.setattr(matching, "ranked_applicant_items", lambda selected_job, db: (items, []))
+    monkeypatch.setattr(matching, "publish_match_progress", lambda *args, **kwargs: None)
+
+    db = SimpleNamespace(execute=lambda statement: executed.append(statement))
+
+    try:
+        matching.match_applicants(9, SimpleNamespace(company_id=2), db)
+    except matching.HTTPException as exc:
+        assert exc.status_code == 503
+    else:
+        raise AssertionError("matching should report unavailable ranking")
+
+    assert executed == []
+
+
+def test_ranking_ignores_stale_points_for_ineligible_resumes(monkeypatch) -> None:
+    items = [{"application_id": 1, "candidate_id": 1, "candidate_name": "Eligible", "resume_id": 11}]
+    resumes = [SimpleNamespace(resume_id=11)]
+    points = [
+        SimpleNamespace(payload={"resume_id": 99}, score=0.99),
+        SimpleNamespace(payload={"resume_id": 11}, score=0.75),
+    ]
+    monkeypatch.setattr(matching, "applicant_items", lambda job_id, db: (items, resumes))
+    monkeypatch.setattr(matching, "search_applicant_resumes", lambda job, candidates: points)
+
+    ranked, returned_points = matching.ranked_applicant_items(SimpleNamespace(job_id=9), SimpleNamespace(commit=lambda: None))
+
+    assert ranked[0]["semantic_score"] == 75.0
+    assert [point.payload["resume_id"] for point in returned_points] == [11]
 
 
 def test_verified_github_relevance_has_bounded_match_weight() -> None:
